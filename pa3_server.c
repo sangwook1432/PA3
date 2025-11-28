@@ -183,12 +183,6 @@ int main(int argc, char* argv[]) {
   setup_users(&users);
 
   Seat* seats = default_seats();
-  // [필수 수정] Seats 초기화 (Garbage 제거)
-  for (int i = 0; i < NUM_SEATS; i++) {
-      seats[i].user_who_booked = NULL;
-      seats[i].amount_of_times_booked = 0;
-      seats[i].amount_of_times_canceled = 0;
-  }
 
   int32_t n_cores = get_num_cores();
 
