@@ -2,7 +2,6 @@
 #include <ctype.h>
 #include <editline/readline.h>
 #include <errno.h>
-#include <helper.h>
 #include <netinet/in.h>
 #include <pa3_error.h>
 #include <signal.h>
@@ -11,14 +10,15 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <netdb.h> 
 #include "handle_response.h"
 #include "helper.h"
 
 const char* active_user = NULL;
 bool sigint_received = false;
 
-// [Week 10 교안] gethostbyname 사용하여 연결
+// -------------------------------------
+// get_socket
+// -------------------------------------
 int32_t get_socket(char* hostname, uint64_t port) {
   int sockfd;
   struct hostent* host_entry;
@@ -49,21 +49,47 @@ int32_t get_socket(char* hostname, uint64_t port) {
   return sockfd;
 }
 
-// [Protocol] Action -> NameLen -> DataSize -> Name -> Data 순서로 전송
+// -------------------------------------
+// send_request
+// -------------------------------------
 void send_request(int32_t sockfd, Request* request) {
-  if (write(sockfd, &request->action, sizeof(request->action)) < 0) return;
-  if (write(sockfd, &request->username_length, sizeof(request->username_length)) < 0) return;
-  if (write(sockfd, &request->data_size, sizeof(request->data_size)) < 0) return;
+  // action
+  write(sockfd, &request->action, sizeof(request->action));
 
+  // username length
+  write(sockfd, &request->username_length, sizeof(request->username_length));
+
+  // data size
+  write(sockfd, &request->data_size, sizeof(request->data_size));
+
+  // username
   if (request->username_length > 0 && request->username != NULL) {
-    write(sockfd, request->username, request->username_length);
+    size_t sent = 0;
+    while (sent < request->username_length) {
+      ssize_t n = write(sockfd,
+                        request->username + sent,
+                        request->username_length - sent);
+      if (n <= 0) return;
+      sent += n;
+    }
   }
+
+  // data
   if (request->data_size > 0 && request->data != NULL) {
-    write(sockfd, request->data, request->data_size);
+    size_t sent = 0;
+    while (sent < request->data_size) {
+      ssize_t n = write(sockfd,
+                        request->data + sent,
+                        request->data_size - sent);
+      if (n <= 0) return;
+      sent += n;
+    }
   }
 }
 
-// [Protocol] DataSize -> Code -> Data 순서로 수신
+// -------------------------------------
+// receive_response
+// -------------------------------------
 void receive_response(int32_t sockfd, Response* response) {
   response->data = NULL;
   response->data_size = 0;
@@ -73,35 +99,48 @@ void receive_response(int32_t sockfd, Response* response) {
 
   if (response->data_size > 0) {
     response->data = malloc(response->data_size);
-    if (response->data) {
-        recv(sockfd, response->data, response->data_size, MSG_WAITALL);
+    if (!response->data) {
+      response->data_size = 0;
+      return;
+    }
+
+    if (recv(sockfd, response->data, response->data_size, MSG_WAITALL) <= 0) {
+      free(response->data);
+      response->data = NULL;
+      response->data_size = 0;
     }
   }
 }
 
+// -------------------------------------
+// terminate
+// -------------------------------------
 void terminate(int32_t sockfd, const char* active_user) {
   if (active_user != NULL) {
-    Request logout_req;
-    default_request(&logout_req);
-    
-    logout_req.action = ACTION_LOGOUT;
-    logout_req.username_length = strlen(active_user) + 1;
-    logout_req.username = strdup(active_user);
-    logout_req.data_size = 0;
-    
-    send_request(sockfd, &logout_req);
-    
-    Response response;
-    receive_response(sockfd, &response);
-    
-    const char* current_user_ptr = active_user;
-    handle_response(ACTION_LOGOUT, &logout_req, &response, &current_user_ptr);
-    
-    free_request(&logout_req);
-    free_response(&response);
+    Request req;
+    default_request(&req);
+
+    req.action = ACTION_LOGOUT;
+    req.username_length = strlen(active_user) + 1;
+    req.username = strdup(active_user);
+    req.data_size = 0;
+
+    send_request(sockfd, &req);
+
+    Response res;
+    receive_response(sockfd, &res);
+
+    const char* tmp = active_user;
+    handle_response(ACTION_LOGOUT, &req, &res, &tmp);
+
+    free_request(&req);
+    free_response(&res);
   }
 }
 
+// -------------------------------------
+// main
+// -------------------------------------
 int main(int argc, char* argv[]) {
   setup_sigint_handler();
 
@@ -121,38 +160,41 @@ int main(int argc, char* argv[]) {
       exit(1);
     }
    
+    char* line = NULL;
     size_t len = 0;
-    while (true) {
-      char* line = NULL;
-      if (getline(&line, &len, file) == -1) {
-        free(line);
-        break;
-      }
 
-      line[strlen(line) - 1] = '\0';
+    while (getline(&line, &len, file) != -1) {
+      size_t L = strlen(line);
+      if (L > 0 && line[L - 1] == '\n') line[L - 1] = '\0';
 
-      if (!line_is_empty(line))
+      if (!line_is_empty(line)) {
         if (!evaluate(line, sockfd, &active_user)) {
           free(line);
-          break;
+          fclose(file);
+          terminate(sockfd, active_user);
+          close(sockfd);
+          return 0;
         }
+      }
+
       free(line);
+      line = NULL;
+      len = 0;
     }
+
     fclose(file);
   } else {
     while (true) {
-      char* input = NULL;
+      char* input = readline("");
+      if (input == NULL || sigint_received) break;
 
-      if (((input = readline("")) == NULL) || sigint_received) {
+      add_history(input);
+
+      if (!evaluate(input, sockfd, &active_user)) {
         free(input);
         break;
       }
 
-      add_history(input);
-      if (!evaluate(input, sockfd, &active_user)) {
-        free(input);
-        break;      
-      }
       free(input);
     }
   }
