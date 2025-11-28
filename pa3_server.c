@@ -50,26 +50,20 @@ void add_to_pollset(PollSet* poll_set,
 }
 
 // This function is called within thread_func.
-// Assuming you have already obtained the lock in thread_func, you do not need to lock the mutex here.
 void remove_from_pollset(ThreadData* data, size_t* i_ptr) {
-  // 현재 인덱스(*i_ptr)에 있는 fd를 닫고 제거
   size_t idx = *i_ptr;
   int fd = data->poll_set->set[idx].fd;
   close(fd);
 
-  // 마지막 요소를 현재 위치로 이동 (순서는 중요하지 않음)
+  // Swap & Pop
   data->poll_set->set[idx] = data->poll_set->set[data->poll_set->size - 1];
   data->poll_set->size--;
 
-  // 인덱스를 하나 줄여서 다음 반복 때 현재 위치(새로 옮겨진 요소)를 다시 검사하게 함
-  (*i_ptr)--;
+  // 인덱스 조정 (현재 위치에 새로운 요소가 왔으므로 다시 검사)
+  if (*i_ptr > 0) (*i_ptr)--; 
+  else (*i_ptr) = 0; // 0번 인덱스일 경우 처리 주의 (보통 0번은 파이프라 삭제 안 되지만 방어 코드)
 }
 
-// You have to poll the poll_set. When there is a file that is ready to be read,
-// you have to lock the poll set to prevent cases where the poll set gets
-// updated. You have to remember to unlock the poll set after you are done
-// reading from it, including cases where you have to exit due to errors, or
-// else your program might not be able to terminate without calling (p)kill.
 void* thread_func(void* arg) {
   ThreadData* data = (ThreadData*)arg;
   
@@ -78,7 +72,6 @@ void* thread_func(void* arg) {
   
   while (!sigint_received) {
     // 1. 공유 자원(PollSet)을 로컬로 복사
-    //    poll() 함수가 블로킹되는 동안 Mutex를 잡고 있으면 add_to_pollset이 막히므로 복사해서 사용
     pthread_mutex_lock(&data->poll_set->mutex);
     size_t current_size = data->poll_set->size;
     memcpy(local_fds, data->poll_set->set, current_size * sizeof(struct pollfd));
@@ -93,13 +86,13 @@ void* thread_func(void* arg) {
 
     // 3. 이벤트 처리
     for (size_t i = 0; i < current_size; i++) {
-      if (local_fds[i].revents & POLLIN) {
+      if (local_fds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
         int fd = local_fds[i].fd;
 
         // Case A: 파이프 알림 (새 클라이언트 연결 등)
-        if (fd == data->pipe_out_fd) { // pipe_out_fd는 항상 set[0]에 있어야 함 (create_poll_set 참조)
-          char buf[1];
-          read(fd, buf, 1); // 파이프 비우기
+        if (fd == data->pipe_out_fd) {
+          char buf[16];
+          read(fd, buf, sizeof(buf)); // 파이프 비우기
           // 루프를 돌면서 다시 복사본을 갱신하러 감
         } 
         // Case B: 클라이언트 요청
@@ -112,23 +105,19 @@ void* thread_func(void* arg) {
           bool connection_closed = false;
 
           // --- Receive Request (TLV) ---
-          // 1. Action (Type)
           int32_t action_val;
           if (sigint_safe_read(fd, &action_val, sizeof(int32_t)) <= 0) connection_closed = true;
           req.action = (Action)action_val;
 
-          // 2. Lengths
           if (!connection_closed && sigint_safe_read(fd, &req.username_length, sizeof(uint64_t)) <= 0) connection_closed = true;
           if (!connection_closed && sigint_safe_read(fd, &req.data_size, sizeof(uint64_t)) <= 0) connection_closed = true;
 
-          // 3. Values (Username)
           if (!connection_closed && req.username_length > 0) {
-            req.username = malloc(req.username_length + 1); // 안전을 위해 +1
+            req.username = malloc(req.username_length + 1);
             if (sigint_safe_read(fd, req.username, req.username_length) <= 0) connection_closed = true;
-            else req.username[req.username_length] = '\0'; // 문자열 보장 (옵션)
+            else req.username[req.username_length] = '\0';
           }
 
-          // 3. Values (Data)
           if (!connection_closed && req.data_size > 0) {
             req.data = malloc(req.data_size + 1);
             if (sigint_safe_read(fd, req.data, req.data_size) <= 0) connection_closed = true;
@@ -136,16 +125,18 @@ void* thread_func(void* arg) {
           }
 
           if (connection_closed) {
-            // 연결 종료 처리
             if (req.username) free(req.username);
             if (req.data) free(req.data);
             
+            // [중요] 실제 공유 PollSet에서 제거해야 함
             pthread_mutex_lock(&data->poll_set->mutex);
-            // 공유 PollSet에서 해당 FD를 찾아 제거해야 함
-            // 로컬 인덱스 i와 공유 인덱스가 다를 수 있으므로 FD로 찾음
             for (size_t k = 0; k < data->poll_set->size; k++) {
                 if (data->poll_set->set[k].fd == fd) {
-                    remove_from_pollset(data, &k);
+                    // remove_from_pollset 함수 내부 로직을 직접 구현하거나 호출
+                    // 여기서는 안전하게 직접 구현 (인덱스 포인터 문제 방지)
+                    close(data->poll_set->set[k].fd);
+                    data->poll_set->set[k] = data->poll_set->set[data->poll_set->size - 1];
+                    data->poll_set->size--;
                     break;
                 }
             }
@@ -154,14 +145,12 @@ void* thread_func(void* arg) {
           }
 
           // --- Process Request ---
-          handle_request(&req, &res, data->users, data->seats);
+          // [수정] 반환값을 res.code에 저장해야 함
+          res.code = handle_request(&req, &res, data->users, data->seats);
 
           // --- Send Response (TLV) ---
-          // 1. Length
           sigint_safe_write(fd, &res.data_size, sizeof(uint64_t));
-          // 2. Type (Code)
           sigint_safe_write(fd, &res.code, sizeof(int32_t));
-          // 3. Value
           if (res.data_size > 0 && res.data != NULL) {
             sigint_safe_write(fd, res.data, res.data_size);
           }
@@ -189,9 +178,18 @@ int main(int argc, char* argv[]) {
   struct sockaddr_in saddr, caddr;
 
   Users users;
+  // [필수 수정] Users 초기화 (Garbage 제거)
+  memset(&users, 0, sizeof(Users));
   setup_users(&users);
 
   Seat* seats = default_seats();
+  // [필수 수정] Seats 초기화 (Garbage 제거)
+  for (int i = 0; i < NUM_SEATS; i++) {
+      seats[i].user_who_booked = NULL;
+      seats[i].amount_of_times_booked = 0;
+      seats[i].amount_of_times_canceled = 0;
+  }
+
   int32_t n_cores = get_num_cores();
 
   pthread_t* tid_arr = malloc(sizeof(pthread_t) * n_cores);
@@ -205,7 +203,7 @@ int main(int argc, char* argv[]) {
     }
 
     data_arr[i].thread_index = i;
-    data_arr[i].pipe_out_fd = pipe_fds[i][0]; // 읽기 전용 파이프
+    data_arr[i].pipe_out_fd = pipe_fds[i][0];
     data_arr[i].poll_set = create_poll_set(pipe_fds[i][0]);
     data_arr[i].users = &users;
     data_arr[i].seats = seats;
@@ -214,7 +212,7 @@ int main(int argc, char* argv[]) {
 
   listenfd = socket(AF_INET, SOCK_STREAM, 0);
   int opt = 1;
-  setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)); // 빠른 재실행을 위해 추가 권장
+  setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
   memset(&saddr, 0, sizeof(saddr));
   saddr.sin_family = AF_INET;
