@@ -39,46 +39,30 @@ ssize_t sigint_safe_read(int32_t fd, void* buf, size_t count) {
 void add_to_pollset(PollSet* poll_set,
                     int32_t notification_fd,
                     int32_t connfd) {
-  // Acquire lock before modifying poll_set
   pthread_mutex_lock(&poll_set->mutex);
-
   if (poll_set->size < CLIENTS_PER_THREAD) {
     poll_set->set[poll_set->size].fd = connfd;
     poll_set->set[poll_set->size].events = POLLIN;
     poll_set->size++;
-  } else {
-    // If the pollset is full, close the connection to avoid resource leak
-    close(connfd);
-    pthread_mutex_unlock(&poll_set->mutex);
-    return;
   }
-
   pthread_mutex_unlock(&poll_set->mutex);
-
-  // Notify the thread that the pollset was updated (write end passed as notification_fd)
   notify_pollset(notification_fd);
 }
 
 // This function is called within thread_func.
 // Assuming you have already obtained the lock in thread_func, you do not need to lock the mutex here.
 void remove_from_pollset(ThreadData* data, size_t* i_ptr) {
-  PollSet* ps = data->poll_set;
-  size_t i = *i_ptr;
+  // 현재 인덱스(*i_ptr)에 있는 fd를 닫고 제거
+  size_t idx = *i_ptr;
+  int fd = data->poll_set->set[idx].fd;
+  close(fd);
 
-  if (i >= ps->size) return;
+  // 마지막 요소를 현재 위치로 이동 (순서는 중요하지 않음)
+  data->poll_set->set[idx] = data->poll_set->set[data->poll_set->size - 1];
+  data->poll_set->size--;
 
-  // Close the client FD
-  close(ps->set[i].fd);
-
-  // Replace this slot with the last slot
-  if (ps->size > 0 && i != ps->size - 1) {
-    ps->set[i] = ps->set[ps->size - 1];
-  }
-
-  ps->size--;
-
-  // Decrement caller's index so that the caller's for-loop can continue correctly
-  if (*i_ptr > 0) (*i_ptr)--;
+  // 인덱스를 하나 줄여서 다음 반복 때 현재 위치(새로 옮겨진 요소)를 다시 검사하게 함
+  (*i_ptr)--;
 }
 
 // You have to poll the poll_set. When there is a file that is ready to be read,
@@ -88,140 +72,109 @@ void remove_from_pollset(ThreadData* data, size_t* i_ptr) {
 // else your program might not be able to terminate without calling (p)kill.
 void* thread_func(void* arg) {
   ThreadData* data = (ThreadData*)arg;
+  
+  // 로컬 폴링 배열 (PollSet 복사본)
+  struct pollfd local_fds[CLIENTS_PER_THREAD];
+  
   while (!sigint_received) {
-    // 1) Copy poll_set under lock to avoid races, then poll on the copy
+    // 1. 공유 자원(PollSet)을 로컬로 복사
+    //    poll() 함수가 블로킹되는 동안 Mutex를 잡고 있으면 add_to_pollset이 막히므로 복사해서 사용
     pthread_mutex_lock(&data->poll_set->mutex);
-    size_t sz = data->poll_set->size;
-    if (sz == 0) {
-      pthread_mutex_unlock(&data->poll_set->mutex);
-      // nothing to poll; small sleep to avoid busy wait
-      usleep(1000);
-      continue;
-    }
-
-    struct pollfd* local_set = malloc(sizeof(struct pollfd) * sz);
-    if (!local_set) {
-      pthread_mutex_unlock(&data->poll_set->mutex);
-      usleep(1000);
-      continue;
-    }
-    memcpy(local_set, data->poll_set->set, sizeof(struct pollfd) * sz);
+    size_t current_size = data->poll_set->size;
+    memcpy(local_fds, data->poll_set->set, current_size * sizeof(struct pollfd));
     pthread_mutex_unlock(&data->poll_set->mutex);
 
-    int ret = poll(local_set, sz, -1);
-    if (ret < 0) {
-      free(local_set);
+    // 2. poll 실행
+    if (poll(local_fds, current_size, -1) < 0) {
       if (errno == EINTR) continue;
+      perror("poll");
       break;
     }
 
-    // 2) For each entry with events, map it back to the real poll_set and handle
-    pthread_mutex_lock(&data->poll_set->mutex);
-    for (size_t j = 0; j < sz; j++) {
-      if (!(local_set[j].revents & (POLLIN | POLLERR | POLLHUP))) continue;
+    // 3. 이벤트 처리
+    for (size_t i = 0; i < current_size; i++) {
+      if (local_fds[i].revents & POLLIN) {
+        int fd = local_fds[i].fd;
 
-      int ready_fd = local_set[j].fd;
+        // Case A: 파이프 알림 (새 클라이언트 연결 등)
+        if (fd == data->pipe_out_fd) { // pipe_out_fd는 항상 set[0]에 있어야 함 (create_poll_set 참조)
+          char buf[1];
+          read(fd, buf, 1); // 파이프 비우기
+          // 루프를 돌면서 다시 복사본을 갱신하러 감
+        } 
+        // Case B: 클라이언트 요청
+        else {
+          Request req;
+          Response res;
+          memset(&req, 0, sizeof(Request));
+          memset(&res, 0, sizeof(Response));
+          
+          bool connection_closed = false;
 
-      // find ready_fd in the real poll_set
-      ssize_t idx = -1;
-      for (size_t k = 0; k < data->poll_set->size; k++) {
-        if (data->poll_set->set[k].fd == ready_fd) {
-          idx = (ssize_t)k;
-          break;
+          // --- Receive Request (TLV) ---
+          // 1. Action (Type)
+          int32_t action_val;
+          if (sigint_safe_read(fd, &action_val, sizeof(int32_t)) <= 0) connection_closed = true;
+          req.action = (Action)action_val;
+
+          // 2. Lengths
+          if (!connection_closed && sigint_safe_read(fd, &req.username_length, sizeof(uint64_t)) <= 0) connection_closed = true;
+          if (!connection_closed && sigint_safe_read(fd, &req.data_size, sizeof(uint64_t)) <= 0) connection_closed = true;
+
+          // 3. Values (Username)
+          if (!connection_closed && req.username_length > 0) {
+            req.username = malloc(req.username_length + 1); // 안전을 위해 +1
+            if (sigint_safe_read(fd, req.username, req.username_length) <= 0) connection_closed = true;
+            else req.username[req.username_length] = '\0'; // 문자열 보장 (옵션)
+          }
+
+          // 3. Values (Data)
+          if (!connection_closed && req.data_size > 0) {
+            req.data = malloc(req.data_size + 1);
+            if (sigint_safe_read(fd, req.data, req.data_size) <= 0) connection_closed = true;
+            else req.data[req.data_size] = '\0';
+          }
+
+          if (connection_closed) {
+            // 연결 종료 처리
+            if (req.username) free(req.username);
+            if (req.data) free(req.data);
+            
+            pthread_mutex_lock(&data->poll_set->mutex);
+            // 공유 PollSet에서 해당 FD를 찾아 제거해야 함
+            // 로컬 인덱스 i와 공유 인덱스가 다를 수 있으므로 FD로 찾음
+            for (size_t k = 0; k < data->poll_set->size; k++) {
+                if (data->poll_set->set[k].fd == fd) {
+                    remove_from_pollset(data, &k);
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&data->poll_set->mutex);
+            continue;
+          }
+
+          // --- Process Request ---
+          handle_request(&req, &res, data->users, data->seats);
+
+          // --- Send Response (TLV) ---
+          // 1. Length
+          sigint_safe_write(fd, &res.data_size, sizeof(uint64_t));
+          // 2. Type (Code)
+          sigint_safe_write(fd, &res.code, sizeof(int32_t));
+          // 3. Value
+          if (res.data_size > 0 && res.data != NULL) {
+            sigint_safe_write(fd, res.data, res.data_size);
+          }
+
+          // --- Cleanup ---
+          if (req.username) free(req.username);
+          if (req.data) free(req.data);
+          if (res.data) free(res.data);
         }
       }
-      if (idx == -1) {
-        // fd already removed by another operation
-        continue;
-      }
-
-      // If it's the pipe read-end (index 0), consume notification and continue
-      if ((size_t)idx == 0) {
-        char drain[64];
-        // read whatever is in the pipe to clear notification
-        sigint_safe_read(data->poll_set->set[0].fd, drain, sizeof(drain));
-        continue;
-      }
-
-      // Handle client at index idx
-      size_t i = (size_t)idx;
-      int connfd = data->poll_set->set[i].fd;
-      Request request;
-      memset(&request, 0, sizeof(request));
-      request.username = NULL;
-      request.data = NULL;
-
-      // Read action; on failure, remove client
-      if (sigint_safe_read(connfd, &request.action, sizeof(request.action)) <= 0) {
-        remove_from_pollset(data, &i);
-        continue;
-      }
-
-      // Read username_length and data_size
-      if (sigint_safe_read(connfd, &request.username_length, sizeof(request.username_length)) <= 0) {
-        remove_from_pollset(data, &i);
-        continue;
-      }
-      if (sigint_safe_read(connfd, &request.data_size, sizeof(request.data_size)) <= 0) {
-        remove_from_pollset(data, &i);
-        continue;
-      }
-
-      // Read username if any
-      if (request.username_length > 0) {
-        request.username = malloc(request.username_length);
-        if (!request.username) {
-          remove_from_pollset(data, &i);
-          continue;
-        }
-        if (sigint_safe_read(connfd, request.username, request.username_length) <= 0) {
-          free(request.username);
-          remove_from_pollset(data, &i);
-          continue;
-        }
-      }
-
-      // Read data if any
-      if (request.data_size > 0) {
-        request.data = malloc(request.data_size);
-        if (!request.data) {
-          if (request.username) free(request.username);
-          remove_from_pollset(data, &i);
-          continue;
-        }
-        if (sigint_safe_read(connfd, request.data, request.data_size) <= 0) {
-          if (request.username) free(request.username);
-          free(request.data);
-          remove_from_pollset(data, &i);
-          continue;
-        }
-      }
-
-      // Process request
-      Response response;
-      memset(&response, 0, sizeof(response));
-      response.data = NULL;
-      response.data_size = 0;
-
-      response.code = handle_request(&request, &response, data->users, data->seats);
-
-      // Send response: data_size -> code -> data
-      sigint_safe_write(connfd, &response.data_size, sizeof(response.data_size));
-      sigint_safe_write(connfd, &response.code, sizeof(response.code));
-      if (response.data_size > 0 && response.data) {
-        sigint_safe_write(connfd, response.data, response.data_size);
-      }
-
-      // Cleanup
-      if (request.username) free(request.username);
-      if (request.data) free(request.data);
-      if (response.data) free(response.data);
     }
-
-    pthread_mutex_unlock(&data->poll_set->mutex);
-    free(local_set);
   }
-  pthread_exit(nullptr);
+  pthread_exit(NULL);
 }
 
 int main(int argc, char* argv[]) {
@@ -252,21 +205,26 @@ int main(int argc, char* argv[]) {
     }
 
     data_arr[i].thread_index = i;
-    data_arr[i].pipe_out_fd = pipe_fds[i][0];
+    data_arr[i].pipe_out_fd = pipe_fds[i][0]; // 읽기 전용 파이프
     data_arr[i].poll_set = create_poll_set(pipe_fds[i][0]);
     data_arr[i].users = &users;
     data_arr[i].seats = seats;
-    pthread_create(&tid_arr[i], nullptr, thread_func, &data_arr[i]);
+    pthread_create(&tid_arr[i], NULL, thread_func, &data_arr[i]);
   }
 
   listenfd = socket(AF_INET, SOCK_STREAM, 0);
+  int opt = 1;
+  setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)); // 빠른 재실행을 위해 추가 권장
 
   memset(&saddr, 0, sizeof(saddr));
   saddr.sin_family = AF_INET;
   saddr.sin_addr.s_addr = htonl(INADDR_ANY);
-  saddr.sin_port = htons(strtoull(argv[1], nullptr, 10));
+  saddr.sin_port = htons(strtoull(argv[1], NULL, 10));
 
-  bind(listenfd, (struct sockaddr*)&saddr, sizeof(saddr));
+  if (bind(listenfd, (struct sockaddr*)&saddr, sizeof(saddr)) < 0) {
+      perror("bind failed");
+      exit(EXIT_FAILURE);
+  }
   listen(listenfd, 10);
 
   struct pollfd main_thread_poll_set[2];
@@ -306,6 +264,7 @@ int main(int argc, char* argv[]) {
       do {
         pollset_i = find_suitable_pollset(data_arr, n_cores);
       } while (pollset_i == -1);
+      
       add_to_pollset(data_arr[pollset_i].poll_set, pipe_fds[pollset_i][1],
                      connfd);
     }
