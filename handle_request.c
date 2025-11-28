@@ -6,231 +6,319 @@
 #include <pthread.h>
 #include "helper.h"
 
-static pthread_mutex_t users_mutex = PTHREAD_MUTEX_INITIALIZER;
+// Users 배열 접근을 보호하기 위한 정적 뮤텍스 (Users 구조체에 락이 없으므로 추가)
+static pthread_mutex_t user_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-LoginErrorCode handle_login_request(const Request* request, Response* response, Users* users) {
-    (void)response;
+// Helper: 문자열이 숫자인지 확인
+int is_number(const char* str) {
+  if (!str || *str == '\0') return 0;
+  char* endptr;
+  strtoull(str, &endptr, 10);
+  return *endptr == '\0';
+}
 
-    pthread_mutex_lock(&users_mutex);
-    ssize_t idx = find_user(users, request->username);
+LoginErrorCode handle_login_request(const Request* request,
+                                    Response* response,
+                                    Users* users) {
+  if (request->data_size == 0 || request->data == NULL) {
+    return LOGIN_ERROR_NO_PASSWORD; // [cite: 214]
+  }
 
-    if (idx != -1) {
-        User* user_ptr = &users->array[idx];
+  char* username = request->username;
+  char* password = request->data; // Login action uses data field for password [cite: 171]
 
-        if (user_ptr->logged_in) {
-            pthread_mutex_unlock(&users_mutex);
-            return LOGIN_ERROR_ACTIVE_USER;
-        }
+  pthread_mutex_lock(&user_mutex);
 
-        if (validate_password(request->data, user_ptr->hashed_password)) {
-            user_ptr->logged_in = true;
-            pthread_mutex_unlock(&users_mutex);
-            return LOGIN_ERROR_SUCCESS;
-        }
+  ssize_t uid = find_user(users, username);
 
-        pthread_mutex_unlock(&users_mutex);
-        return LOGIN_ERROR_INCORRECT_PASSWORD;
-    }
-
-    // create new user
-    char hashed[HASHED_PASSWORD_SIZE];
-    hash_password(request->data, hashed);
-    add_user(users, request->username, hashed);
-
-    // auto login
-    idx = find_user(users, request->username);
-    if (idx != -1) users->array[idx].logged_in = true;
-
-    pthread_mutex_unlock(&users_mutex);
+  if (uid == -1) {
+    // 신규 유저 등록 [cite: 197-201]
+    char hashed_password[HASHED_PASSWORD_SIZE];
+    hash_password(password, hashed_password);
+    size_t new_uid = add_user(users, username, hashed_password);
+    users->array[new_uid].logged_in = true;
+    pthread_mutex_unlock(&user_mutex);
     return LOGIN_ERROR_SUCCESS;
+  } else {
+    // 기존 유저 로그인 [cite: 204-206]
+    User* user = &users->array[uid];
+
+    // 이미 로그인되어 있는지 확인 [cite: 214]
+    if (user->logged_in) {
+      pthread_mutex_unlock(&user_mutex);
+      return LOGIN_ERROR_ACTIVE_USER;
+    }
+
+    // 비밀번호 검증
+    if (validate_password(password, user->hashed_password)) {
+      user->logged_in = true;
+      pthread_mutex_unlock(&user_mutex);
+      return LOGIN_ERROR_SUCCESS;
+    } else {
+      pthread_mutex_unlock(&user_mutex);
+      return LOGIN_ERROR_INCORRECT_PASSWORD;
+    }
+  }
 }
 
-BookErrorCode handle_book_request(const Request* request, Response* response, Users* users, Seat* seats) {
-    (void)response;
-    pthread_mutex_lock(&users_mutex);
-    ssize_t user_idx = find_user(users, request->username);
-    if (user_idx == -1 || !users->array[user_idx].logged_in) {
-        pthread_mutex_unlock(&users_mutex);
-        return BOOK_ERROR_USER_NOT_LOGGED_IN;
-    }
-    pthread_mutex_unlock(&users_mutex);
+BookErrorCode handle_book_request(const Request* request,
+                                  Response* response,
+                                  Users* users,
+                                  Seat* seats) {
+  // 1. 데이터 유효성 검사
+  if (request->data_size == 0 || request->data == NULL) {
+    return BOOK_ERROR_NO_DATA; // [cite: 227]
+  }
 
-    int seat_id = atoi(request->data);
-    if (seat_id < 1 || seat_id > NUM_SEATS)
-        return BOOK_ERROR_SEAT_OUT_OF_RANGE;
+  // 2. 유저 로그인 상태 확인 (Lock 필요)
+  pthread_mutex_lock(&user_mutex);
+  ssize_t uid = find_user(users, request->username);
+  if (uid == -1 || !users->array[uid].logged_in) {
+    pthread_mutex_unlock(&user_mutex);
+    return BOOK_ERROR_USER_NOT_LOGGED_IN; // [cite: 227]
+  }
+  pthread_mutex_unlock(&user_mutex);
 
-    Seat* seat = &seats[seat_id - 1];
+  // 3. 좌석 번호 파싱 및 범위 확인
+  if (!is_number(request->data)) {
+      return BOOK_ERROR_SEAT_OUT_OF_RANGE;
+  }
+  int seat_id = atoi(request->data);
+  if (seat_id < 1 || seat_id > NUM_SEATS) {
+    return BOOK_ERROR_SEAT_OUT_OF_RANGE; // [cite: 227]
+  }
 
-    pthread_mutex_lock(&seat->mutex);
+  // 4. 좌석 예약 (개별 좌석 Lock)
+  Seat* seat = &seats[seat_id - 1]; // 0-indexed
+  pthread_mutex_lock(&seat->mutex);
 
-    if (seat->user_who_booked != NULL) {
-        pthread_mutex_unlock(&seat->mutex);
-        return BOOK_ERROR_SEAT_UNAVAILABLE;
-    }
-
-    seat->user_who_booked = strdup(request->username);
-    seat->amount_of_times_booked++;
-
+  if (seat->user_who_booked != NULL) {
     pthread_mutex_unlock(&seat->mutex);
-    return BOOK_ERROR_SUCCESS;
+    return BOOK_ERROR_SEAT_UNAVAILABLE; // [cite: 227]
+  }
+
+  seat->user_who_booked = strdup(request->username);
+  seat->amount_of_times_booked++;
+  
+  pthread_mutex_unlock(&seat->mutex);
+
+  return BOOK_ERROR_SUCCESS;
 }
+
 ConfirmBookingErrorCode handle_confirm_booking_request(const Request* request,
                                                        Response* response,
                                                        Users* users,
-                                                       Seat* seats)
-{
-    pthread_mutex_lock(&users_mutex);
-    ssize_t user_idx = find_user(users, request->username);
-    if (user_idx == -1 || !users->array[user_idx].logged_in) {
-        pthread_mutex_unlock(&users_mutex);
-        return CONFIRM_BOOKING_ERROR_USER_NOT_LOGGED_IN;
-    }
-    pthread_mutex_unlock(&users_mutex);
+                                                       Seat* seats) {
+  if (request->data_size == 0 || request->data == NULL) {
+      return CONFIRM_BOOKING_ERROR_NO_DATA;
+  }
 
-    pa3_seat_t* result_seats = malloc(sizeof(pa3_seat_t) * NUM_SEATS);
-    int count = 0;
+  // 1. 유저 로그인 확인
+  pthread_mutex_lock(&user_mutex);
+  ssize_t uid = find_user(users, request->username);
+  if (uid == -1 || !users->array[uid].logged_in) {
+    pthread_mutex_unlock(&user_mutex);
+    return CONFIRM_BOOKING_ERROR_USER_NOT_LOGGED_IN;
+  }
+  pthread_mutex_unlock(&user_mutex);
 
-    if (strcmp(request->data, "available") == 0) {
+  // 2. 요청 타입 확인 ("available" or "booked")
+  bool check_available = false;
+  if (strcmp(request->data, "available") == 0) {
+    check_available = true;
+  } else if (strcmp(request->data, "booked") == 0) {
+    check_available = false;
+  } else {
+    return CONFIRM_BOOKING_ERROR_INVALID_DATA;
+  }
 
-        for (int i = 0; i < NUM_SEATS; i++) {
-            pthread_mutex_lock(&seats[i].mutex);
-            if (seats[i].user_who_booked == NULL)
-                result_seats[count++] = seats[i].id;
-            pthread_mutex_unlock(&seats[i].mutex);
-        }
+  // 3. 좌석 정보 수집
+  // 응답 데이터는 size_t(pa3_seat_t) 배열이어야 함. 최대 100개.
+  size_t* result_array = malloc(sizeof(size_t) * NUM_SEATS);
+  int count = 0;
 
-    } else if (strcmp(request->data, "booked") == 0) {
-
-        for (int i = 0; i < NUM_SEATS; i++) {
-            pthread_mutex_lock(&seats[i].mutex);
-            if (seats[i].user_who_booked != NULL &&
-                strcmp(seats[i].user_who_booked, request->username) == 0)
-                result_seats[count++] = seats[i].id;
-            pthread_mutex_unlock(&seats[i].mutex);
-        }
-
+  for (int i = 0; i < NUM_SEATS; i++) {
+    pthread_mutex_lock(&seats[i].mutex);
+    bool condition_met = false;
+    
+    if (check_available) {
+      if (seats[i].user_who_booked == NULL) condition_met = true;
     } else {
-        free(result_seats);
-        return CONFIRM_BOOKING_ERROR_INVALID_DATA;
+      if (seats[i].user_who_booked != NULL && 
+          strcmp(seats[i].user_who_booked, request->username) == 0) {
+        condition_met = true;
+      }
     }
 
-    response->data = (uint8_t*)result_seats;
-    response->data_size = count * sizeof(pa3_seat_t);
-    return CONFIRM_BOOKING_ERROR_SUCCESS;
+    if (condition_met) {
+      result_array[count++] = seats[i].id;
+    }
+    pthread_mutex_unlock(&seats[i].mutex);
+  }
+
+  // 4. 응답 설정
+  response->data = (uint8_t*)result_array;
+  response->data_size = count * sizeof(size_t);
+  
+  // 만약 데이터가 없으면 free하고 NULL 처리 (프로토콜상 size 0이면 data 무시됨)
+  if (count == 0) {
+      free(result_array);
+      response->data = NULL;
+  }
+
+  return CONFIRM_BOOKING_ERROR_SUCCESS;
 }
-int32_t handle_cancel_booking_request(const Request* request, Response* response,
-                                      Users* users, Seat* seats)
-{
-    (void)response;
 
-    // login check
-    pthread_mutex_lock(&users_mutex);
-    ssize_t user_idx = find_user(users, request->username);
-    if (user_idx == -1 || !users->array[user_idx].logged_in) {
-        pthread_mutex_unlock(&users_mutex);
-        return CANCEL_BOOKING_ERROR_USER_NOT_LOGGED_IN;
-    }
-    pthread_mutex_unlock(&users_mutex);
+int32_t handle_cancel_booking_request(const Request* request,
+                                      Response* response,
+                                      Users* users,
+                                      Seat* seats) {
+  if (request->data_size == 0 || request->data == NULL) {
+      return CANCEL_BOOKING_ERROR_NO_DATA;
+  }
 
-    int seat_id = atoi(request->data);
-    if (seat_id < 1 || seat_id > NUM_SEATS)
-        return CANCEL_BOOKING_ERROR_SEAT_OUT_OF_RANGE;
+  // 1. 유저 로그인 확인
+  pthread_mutex_lock(&user_mutex);
+  ssize_t uid = find_user(users, request->username);
+  if (uid == -1 || !users->array[uid].logged_in) {
+    pthread_mutex_unlock(&user_mutex);
+    return CANCEL_BOOKING_ERROR_USER_NOT_LOGGED_IN;
+  }
+  pthread_mutex_unlock(&user_mutex);
 
-    Seat* seat = &seats[seat_id - 1];
+  // 2. 좌석 번호 확인
+  if (!is_number(request->data)) {
+      return CANCEL_BOOKING_ERROR_SEAT_OUT_OF_RANGE;
+  }
+  int seat_id = atoi(request->data);
+  if (seat_id < 1 || seat_id > NUM_SEATS) {
+    return CANCEL_BOOKING_ERROR_SEAT_OUT_OF_RANGE;
+  }
 
-    pthread_mutex_lock(&seat->mutex);
+  // 3. 취소 처리
+  Seat* seat = &seats[seat_id - 1];
+  pthread_mutex_lock(&seat->mutex);
 
-    if (seat->user_who_booked == NULL ||
-        strcmp(seat->user_who_booked, request->username) != 0)
-    {
-        pthread_mutex_unlock(&seat->mutex);
-        return CANCEL_BOOKING_ERROR_SEAT_NOT_BOOKED_BY_USER;
-    }
-
-    free(seat->user_who_booked);
-    seat->user_who_booked = NULL;
-    seat->amount_of_times_canceled++;
-
+  if (seat->user_who_booked == NULL || 
+      strcmp(seat->user_who_booked, request->username) != 0) {
     pthread_mutex_unlock(&seat->mutex);
-    return CANCEL_BOOKING_ERROR_SUCCESS;
-}
-int32_t handle_logout_request(const Request* request, Response* response, Users* users) {
-    (void)response;
+    return CANCEL_BOOKING_ERROR_SEAT_NOT_BOOKED_BY_USER;
+  }
 
-    pthread_mutex_lock(&users_mutex);
-    ssize_t idx = find_user(users, request->username);
+  // 예약 해제
+  free((void*)seat->user_who_booked);
+  seat->user_who_booked = NULL;
+  seat->amount_of_times_canceled++;
 
-    if (idx == -1) {
-        pthread_mutex_unlock(&users_mutex);
-        return LOGOUT_ERROR_USER_NOT_FOUND;
-    }
+  pthread_mutex_unlock(&seat->mutex);
 
-    if (!users->array[idx].logged_in) {
-        pthread_mutex_unlock(&users_mutex);
-        return LOGOUT_ERROR_USER_NOT_LOGGED_IN;
-    }
-
-    users->array[idx].logged_in = false;
-    pthread_mutex_unlock(&users_mutex);
-    return LOGOUT_ERROR_SUCCESS;
+  return CANCEL_BOOKING_ERROR_SUCCESS;
 }
 
-int32_t handle_query_request(const Request* request, Response* response, Seat* seats) {
+int32_t handle_logout_request(const Request* request,
+                              Response* response,
+                              Users* users) {
+  pthread_mutex_lock(&user_mutex);
+  
+  ssize_t uid = find_user(users, request->username);
+  
+  if (uid == -1) {
+    pthread_mutex_unlock(&user_mutex);
+    return LOGOUT_ERROR_USER_NOT_FOUND;
+  }
 
-    int seat_id = atoi(request->data);
-    if (seat_id < 1 || seat_id > NUM_SEATS)
-        return QUERY_ERROR_SEAT_OUT_OF_RANGE;
+  if (!users->array[uid].logged_in) {
+    pthread_mutex_unlock(&user_mutex);
+    return LOGOUT_ERROR_USER_NOT_LOGGED_IN;
+  }
 
-    Seat* seat = &seats[seat_id - 1];
+  users->array[uid].logged_in = false;
+  pthread_mutex_unlock(&user_mutex);
 
-    pthread_mutex_lock(&seat->mutex);
+  return LOGOUT_ERROR_SUCCESS;
+}
 
-    typedef struct {
-        int id;
-        int amount_of_times_booked;
-        int amount_of_times_canceled;
-        char user[64];
-    } SeatInfo;
+int32_t handle_query_request(const Request* request,
+                             Response* response,
+                             Seat* seats) {
+  if (request->data_size == 0 || request->data == NULL) {
+      return QUERY_ERROR_NO_DATA;
+  }
 
-    SeatInfo info;
-    info.id = seat->id;
-    info.amount_of_times_booked = seat->amount_of_times_booked;
-    info.amount_of_times_canceled = seat->amount_of_times_canceled;
+  // 1. 좌석 번호 확인
+  if (!is_number(request->data)) {
+      return QUERY_ERROR_SEAT_OUT_OF_RANGE;
+  }
+  int seat_id = atoi(request->data);
+  if (seat_id < 1 || seat_id > NUM_SEATS) {
+    return QUERY_ERROR_SEAT_OUT_OF_RANGE;
+  }
 
-    if (seat->user_who_booked)
-        strncpy(info.user, seat->user_who_booked, 63);
-    else
-        info.user[0] = '\0';
+  // 2. 좌석 정보 조회
+  // 클라이언트는 Seat 구조체 전체를 바이너리로 받기를 원함 [cite: 265]
+  Seat* seat_data = malloc(sizeof(Seat));
+  Seat* target_seat = &seats[seat_id - 1];
+  
+  pthread_mutex_lock(&target_seat->mutex);
+  
+  // 구조체 복사 (Deep copy of user_who_booked is tricky here, 
+  // but client mainly needs IDs and counts. 
+  // user_who_booked is a pointer. Sending a pointer value to client is meaningless.
+  // However, client code sets seat->user_who_booked = nullptr after memcpy.
+  // So a shallow copy of the struct is fine for the counts and ID.)
+  memcpy(seat_data, target_seat, sizeof(Seat));
+  
+  pthread_mutex_unlock(&target_seat->mutex);
 
-    response->data = malloc(sizeof(SeatInfo));
-    memcpy(response->data, &info, sizeof(SeatInfo));
-    response->data_size = sizeof(SeatInfo);
+  // 포인터 정보는 클라이언트에서 의미 없으므로 NULL 처리 (선택사항, 클라이언트가 어차피 덮어씀)
+  seat_data->user_who_booked = NULL;
+  // 뮤텍스도 클라이언트에서 쓸 일 없음
 
-    pthread_mutex_unlock(&seat->mutex);
+  response->data = (uint8_t*)seat_data;
+  response->data_size = sizeof(Seat);
 
-    return QUERY_ERROR_SUCCESS;
+  return QUERY_ERROR_SUCCESS;
 }
 
 int32_t handle_request(const Request* request,
                        Response* response,
                        Users* users,
                        Seat* seats) {
+  // 응답 데이터 초기화
+  response->data = NULL;
+  response->data_size = 0;
+  
+  int32_t ret_code;
+
   switch (request->action) {
     case ACTION_LOGIN:
-      return handle_login_request(request, response, users);
+      ret_code = handle_login_request(request, response, users);
+      break;
     case ACTION_BOOK:
-      return handle_book_request(request, response, users, seats);
+      ret_code = handle_book_request(request, response, users, seats);
+      break;
     case ACTION_CONFIRM_BOOKING:
-      return handle_confirm_booking_request(request, response, users, seats);
+      ret_code = handle_confirm_booking_request(request, response, users, seats);
+      break;
     case ACTION_CANCEL_BOOKING:
-      return handle_cancel_booking_request(request, response, users, seats);
+      ret_code = handle_cancel_booking_request(request, response, users, seats);
+      break;
     case ACTION_LOGOUT:
-      return handle_logout_request(request, response, users);
+      ret_code = handle_logout_request(request, response, users);
+      break;
     case ACTION_QUERY:
-      return handle_query_request(request, response, seats);
+      ret_code = handle_query_request(request, response, seats);
+      break;
     case ACTION_TERMINATION:
-    //
+      // 서버는 TERMINATION 액션을 받으면 안됨 (PDF 명세 [cite: 147])
+      ret_code = -1; 
+      break;
     default:
-      return -1;
+      // 정의되지 않은 액션 [cite: 93, 153]
+      ret_code = -1;
+      break;
   }
+  
+  response->code = ret_code;
+  return 0; // handle_request return value is typically 0 on success logic flow
 }
