@@ -17,6 +17,7 @@
 
 bool sigint_received = false;
 
+// Helper function: can write to fd safely even when sigint is received
 ssize_t sigint_safe_write(int32_t fd, void* buf, size_t count) {
   ssize_t n_written;
   do {
@@ -25,6 +26,7 @@ ssize_t sigint_safe_write(int32_t fd, void* buf, size_t count) {
   return n_written;
 }
 
+// Helper function: can read from fd safely even when sigint is received
 ssize_t sigint_safe_read(int32_t fd, void* buf, size_t count) {
   ssize_t n_read;
   do {
@@ -33,79 +35,193 @@ ssize_t sigint_safe_read(int32_t fd, void* buf, size_t count) {
   return n_read;
 }
 
-void add_to_pollset(PollSet* poll_set, int32_t notification_fd, int32_t connfd) {
+// Use pthread_mutex_lock when accessing 'PollSet'
+void add_to_pollset(PollSet* poll_set,
+                    int32_t notification_fd,
+                    int32_t connfd) {
+  // Acquire lock before modifying poll_set
   pthread_mutex_lock(&poll_set->mutex);
+
   if (poll_set->size < CLIENTS_PER_THREAD) {
     poll_set->set[poll_set->size].fd = connfd;
     poll_set->set[poll_set->size].events = POLLIN;
     poll_set->size++;
+  } else {
+    // If the pollset is full, close the connection to avoid resource leak
+    close(connfd);
+    pthread_mutex_unlock(&poll_set->mutex);
+    return;
   }
+
   pthread_mutex_unlock(&poll_set->mutex);
+
+  // Notify the thread that the pollset was updated (write end passed as notification_fd)
   notify_pollset(notification_fd);
 }
 
+// This function is called within thread_func.
+// Assuming you have already obtained the lock in thread_func, you do not need to lock the mutex here.
 void remove_from_pollset(ThreadData* data, size_t* i_ptr) {
+  PollSet* ps = data->poll_set;
   size_t i = *i_ptr;
-  close(data->poll_set->set[i].fd);
-  data->poll_set->set[i] = data->poll_set->set[data->poll_set->size - 1];
-  data->poll_set->size--;
-  (*i_ptr)--;
+
+  if (i >= ps->size) return;
+
+  // Close the client FD
+  close(ps->set[i].fd);
+
+  // Replace this slot with the last slot
+  if (ps->size > 0 && i != ps->size - 1) {
+    ps->set[i] = ps->set[ps->size - 1];
+  }
+
+  ps->size--;
+
+  // Decrement caller's index so that the caller's for-loop can continue correctly
+  if (*i_ptr > 0) (*i_ptr)--;
 }
 
+// You have to poll the poll_set. When there is a file that is ready to be read,
+// you have to lock the poll set to prevent cases where the poll set gets
+// updated. You have to remember to unlock the poll set after you are done
+// reading from it, including cases where you have to exit due to errors, or
+// else your program might not be able to terminate without calling (p)kill.
 void* thread_func(void* arg) {
   ThreadData* data = (ThreadData*)arg;
   while (!sigint_received) {
-    int ret = poll(data->poll_set->set, data->poll_set->size, -1);
+    // 1) Copy poll_set under lock to avoid races, then poll on the copy
+    pthread_mutex_lock(&data->poll_set->mutex);
+    size_t sz = data->poll_set->size;
+    if (sz == 0) {
+      pthread_mutex_unlock(&data->poll_set->mutex);
+      // nothing to poll; small sleep to avoid busy wait
+      usleep(1000);
+      continue;
+    }
+
+    struct pollfd* local_set = malloc(sizeof(struct pollfd) * sz);
+    if (!local_set) {
+      pthread_mutex_unlock(&data->poll_set->mutex);
+      usleep(1000);
+      continue;
+    }
+    memcpy(local_set, data->poll_set->set, sizeof(struct pollfd) * sz);
+    pthread_mutex_unlock(&data->poll_set->mutex);
+
+    int ret = poll(local_set, sz, -1);
     if (ret < 0) {
+      free(local_set);
       if (errno == EINTR) continue;
       break;
     }
 
+    // 2) For each entry with events, map it back to the real poll_set and handle
     pthread_mutex_lock(&data->poll_set->mutex);
+    for (size_t j = 0; j < sz; j++) {
+      if (!(local_set[j].revents & (POLLIN | POLLERR | POLLHUP))) continue;
 
-    if (data->poll_set->set[0].revents & POLLIN) {
-      char buf[16];
-      sigint_safe_read(data->poll_set->set[0].fd, buf, sizeof(buf));
-    }
+      int ready_fd = local_set[j].fd;
 
-    for (size_t i = 1; i < data->poll_set->size; i++) {
-      if (data->poll_set->set[i].revents & (POLLIN | POLLERR | POLLHUP)) {
-        int connfd = data->poll_set->set[i].fd;
-        Request request = {0};
+      // find ready_fd in the real poll_set
+      ssize_t idx = -1;
+      for (size_t k = 0; k < data->poll_set->size; k++) {
+        if (data->poll_set->set[k].fd == ready_fd) {
+          idx = (ssize_t)k;
+          break;
+        }
+      }
+      if (idx == -1) {
+        // fd already removed by another operation
+        continue;
+      }
 
-        if (sigint_safe_read(connfd, &request.action, sizeof(request.action)) <= 0) {
+      // If it's the pipe read-end (index 0), consume notification and continue
+      if ((size_t)idx == 0) {
+        char drain[64];
+        // read whatever is in the pipe to clear notification
+        sigint_safe_read(data->poll_set->set[0].fd, drain, sizeof(drain));
+        continue;
+      }
+
+      // Handle client at index idx
+      size_t i = (size_t)idx;
+      int connfd = data->poll_set->set[i].fd;
+      Request request;
+      memset(&request, 0, sizeof(request));
+      request.username = NULL;
+      request.data = NULL;
+
+      // Read action; on failure, remove client
+      if (sigint_safe_read(connfd, &request.action, sizeof(request.action)) <= 0) {
+        remove_from_pollset(data, &i);
+        continue;
+      }
+
+      // Read username_length and data_size
+      if (sigint_safe_read(connfd, &request.username_length, sizeof(request.username_length)) <= 0) {
+        remove_from_pollset(data, &i);
+        continue;
+      }
+      if (sigint_safe_read(connfd, &request.data_size, sizeof(request.data_size)) <= 0) {
+        remove_from_pollset(data, &i);
+        continue;
+      }
+
+      // Read username if any
+      if (request.username_length > 0) {
+        request.username = malloc(request.username_length);
+        if (!request.username) {
           remove_from_pollset(data, &i);
           continue;
         }
-        sigint_safe_read(connfd, &request.username_length, sizeof(request.username_length));
-        sigint_safe_read(connfd, &request.data_size, sizeof(request.data_size));
-
-        if (request.username_length > 0) {
-          request.username = malloc(request.username_length);
-          sigint_safe_read(connfd, request.username, request.username_length);
+        if (sigint_safe_read(connfd, request.username, request.username_length) <= 0) {
+          free(request.username);
+          remove_from_pollset(data, &i);
+          continue;
         }
-        if (request.data_size > 0) {
-          request.data = malloc(request.data_size);
-          sigint_safe_read(connfd, request.data, request.data_size);
-        }
-
-        Response response = {0};
-        response.code = handle_request(&request, &response, data->users, data->seats);
-
-        sigint_safe_write(connfd, &response.data_size, sizeof(response.data_size));
-        sigint_safe_write(connfd, &response.code, sizeof(response.code));
-        if (response.data_size > 0 && response.data) {
-          sigint_safe_write(connfd, response.data, response.data_size);
-        }
-
-        if (request.username) free(request.username);
-        if (request.data) free(request.data);
-        if (response.data) free(response.data);
       }
+
+      // Read data if any
+      if (request.data_size > 0) {
+        request.data = malloc(request.data_size);
+        if (!request.data) {
+          if (request.username) free(request.username);
+          remove_from_pollset(data, &i);
+          continue;
+        }
+        if (sigint_safe_read(connfd, request.data, request.data_size) <= 0) {
+          if (request.username) free(request.username);
+          free(request.data);
+          remove_from_pollset(data, &i);
+          continue;
+        }
+      }
+
+      // Process request
+      Response response;
+      memset(&response, 0, sizeof(response));
+      response.data = NULL;
+      response.data_size = 0;
+
+      response.code = handle_request(&request, &response, data->users, data->seats);
+
+      // Send response: data_size -> code -> data
+      sigint_safe_write(connfd, &response.data_size, sizeof(response.data_size));
+      sigint_safe_write(connfd, &response.code, sizeof(response.code));
+      if (response.data_size > 0 && response.data) {
+        sigint_safe_write(connfd, response.data, response.data_size);
+      }
+
+      // Cleanup
+      if (request.username) free(request.username);
+      if (request.data) free(request.data);
+      if (response.data) free(response.data);
     }
+
     pthread_mutex_unlock(&data->poll_set->mutex);
+    free(local_set);
   }
-  pthread_exit(NULL);
+  pthread_exit(nullptr);
 }
 
 int main(int argc, char* argv[]) {
@@ -120,18 +236,9 @@ int main(int argc, char* argv[]) {
   struct sockaddr_in saddr, caddr;
 
   Users users;
-  // [초기화 필수] Users 구조체 0으로 초기화 (Garbage 제거)
-  memset(&users, 0, sizeof(Users));
   setup_users(&users);
 
   Seat* seats = default_seats();
-  // [초기화 필수] 좌석 정보 NULL 초기화
-  for (int i = 0; i < NUM_SEATS; i++) {
-      seats[i].user_who_booked = NULL;
-      seats[i].amount_of_times_booked = 0;
-      seats[i].amount_of_times_canceled = 0;
-  }
-
   int32_t n_cores = get_num_cores();
 
   pthread_t* tid_arr = malloc(sizeof(pthread_t) * n_cores);
@@ -149,27 +256,18 @@ int main(int argc, char* argv[]) {
     data_arr[i].poll_set = create_poll_set(pipe_fds[i][0]);
     data_arr[i].users = &users;
     data_arr[i].seats = seats;
-    pthread_create(&tid_arr[i], NULL, thread_func, &data_arr[i]);
+    pthread_create(&tid_arr[i], nullptr, thread_func, &data_arr[i]);
   }
 
   listenfd = socket(AF_INET, SOCK_STREAM, 0);
-  int opt = 1;
-  setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
   memset(&saddr, 0, sizeof(saddr));
   saddr.sin_family = AF_INET;
   saddr.sin_addr.s_addr = htonl(INADDR_ANY);
-  saddr.sin_port = htons(strtoull(argv[1], NULL, 10));
+  saddr.sin_port = htons(strtoull(argv[1], nullptr, 10));
 
-  if (bind(listenfd, (struct sockaddr*)&saddr, sizeof(saddr)) < 0) {
-      perror("bind failed");
-      exit(EXIT_FAILURE);
-  }
-  
-  if (listen(listenfd, 10) < 0) {
-      perror("listen failed");
-      exit(EXIT_FAILURE);
-  }
+  bind(listenfd, (struct sockaddr*)&saddr, sizeof(saddr));
+  listen(listenfd, 10);
 
   struct pollfd main_thread_poll_set[2];
   memset(main_thread_poll_set, 0, sizeof(main_thread_poll_set));
@@ -180,7 +278,9 @@ int main(int argc, char* argv[]) {
 
   while (!sigint_received) {
     if (poll(main_thread_poll_set, 2, -1) < 0) {
-      if (errno == EINTR) continue;
+      if (errno == EINTR) {
+        continue;
+      }
       perror("poll");
       exit(EXIT_FAILURE);
     }
@@ -194,7 +294,9 @@ int main(int argc, char* argv[]) {
       uint32_t caddrlen = sizeof(caddr);
       int connfd = accept(listenfd, (struct sockaddr*)&caddr, &caddrlen);
       if (connfd < 0) {
-        if (errno == EINTR) continue;
+        if (errno == EINTR) {
+          continue;
+        }
         puts("accept() failed");
         exit(EXIT_FAILURE);
       }
