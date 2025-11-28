@@ -54,15 +54,15 @@ int32_t get_socket(char* hostname, uint64_t port) {
 // send_request
 // -------------------------------------
 void send_request(int32_t sockfd, Request* request) {
-    // SIGPIPE 발생 시 프로그램 종료 방지 (OS 레벨)
-    // 아래 main에서 SIG_IGN 처리를 하지만, send 로직 내에서도 방어적으로 작성
-
+    // 1. Action
     int32_t action_val = (int32_t)request->action;
     if (write(sockfd, &action_val, sizeof(int32_t)) <= 0) return;
 
+    // 2. Lengths
     if (write(sockfd, &request->username_length, sizeof(uint64_t)) <= 0) return;
     if (write(sockfd, &request->data_size, sizeof(uint64_t)) <= 0) return;
 
+    // 3. Username
     if (request->username_length > 0 && request->username != NULL) {
         size_t sent = 0;
         while (sent < request->username_length) {
@@ -73,6 +73,7 @@ void send_request(int32_t sockfd, Request* request) {
         }
     }
 
+    // 4. Data
     if (request->data_size > 0 && request->data != NULL) {
         size_t sent = 0;
         while (sent < request->data_size) {
@@ -88,34 +89,33 @@ void send_request(int32_t sockfd, Request* request) {
 // receive_response
 // -------------------------------------
 void receive_response(int32_t sockfd, Response* response) {
-    // [DEBUG] 수신 시작
-    memset(response, 0, sizeof(Response)); // 0으로 밀어버림 (안전장치)
+    // 구조체 초기화 (쓰레기 값 방지)
+    memset(response, 0, sizeof(Response));
 
-    uint64_t len_buf = 0;
-    ssize_t res = recv(sockfd, &len_buf, sizeof(uint64_t), MSG_WAITALL);
-    if (res <= 0) return; 
-    response->data_size = len_buf;
+    uint64_t size_buf = 0;
+    // recv가 0이나 -1을 반환하면 연결 종료/에러
+    if (recv(sockfd, &size_buf, sizeof(uint64_t), MSG_WAITALL) <= 0) return;
+    response->data_size = size_buf;
 
     int32_t code_buf = 0;
     if (recv(sockfd, &code_buf, sizeof(int32_t), MSG_WAITALL) <= 0) return;
     response->code = code_buf;
 
     if (response->data_size > 0) {
-        // 비정상적으로 큰 사이즈 체크 (메모리 보호)
-        if (response->data_size > 100 * 1024 * 1024) { 
-            fprintf(stderr, "[ERROR] Response size too big: %lu\n", response->data_size);
-            response->data_size = 0;
-            return;
+        // 비정상적으로 큰 데이터 사이즈 방어 (10MB 제한)
+        if (response->data_size > 10 * 1024 * 1024) {
+             printf("[DEBUG] Too large data size: %lu\n", response->data_size);
+             return; 
         }
 
-        response->data = malloc(response->data_size + 1); // +1 여유 공간
+        response->data = malloc(response->data_size + 1);
         if (!response->data) {
             perror("malloc failed");
             response->data_size = 0;
             return;
         }
         
-        // 메모리 초기화 (valgrind 에러 방지)
+        // 메모리 0으로 초기화
         memset(response->data, 0, response->data_size + 1);
 
         if (recv(sockfd, response->data, response->data_size, MSG_WAITALL) <= 0) {
@@ -131,33 +131,48 @@ void receive_response(int32_t sockfd, Response* response) {
 // -------------------------------------
 void terminate(int32_t sockfd, const char* active_user) {
     if (active_user != NULL) {
-        printf("[DEBUG] Terminating session for user: %s\n", active_user);
+        printf("[DEBUG] Terminate started for user: %s\n", active_user);
+        
         Request req;
-        memset(&req, 0, sizeof(Request)); // 스택 메모리 쓰레기값 제거
+        memset(&req, 0, sizeof(Request));
 
         req.action = ACTION_LOGOUT;
+        // active_user 문자열을 복사해서 사용 (strdup 필수)
         req.username_length = strlen(active_user); 
         req.username = strdup(active_user);
         req.data_size = 0;
         req.data = NULL;
 
         send_request(sockfd, &req);
-        printf("[DEBUG] Logout request sent.\n");
+        printf("[DEBUG] Logout sent\n");
 
         Response res;
-        memset(&res, 0, sizeof(Response)); // 스택 메모리 초기화
+        memset(&res, 0, sizeof(Response)); // 중요: 초기화
 
         receive_response(sockfd, &res);
         printf("[DEBUG] Logout response received. Code: %d\n", res.code);
 
-        // handle_response 내부에서 res.data를 free합니다.
-        // active_user 문자열 처리 주의
+        // handle_response 호출
+        // 주의: active_user 포인터를 넘기면 내부에서 free를 시도할 수 있음.
+        // 여기서는 복사본(tmp) 주소를 넘겨서 안전하게 처리
         const char* tmp_user = active_user; 
         handle_response(ACTION_LOGOUT, &req, &res, &tmp_user);
-        printf("[DEBUG] handle_response finished.\n");
+        printf("[DEBUG] handle_response finished\n");
 
-        if (req.username) free(req.username);
-        // if (res.data) free(res.data); <-- 삭제됨 (handle_response가 해제함)
+        // Request의 username 해제 (우리가 malloc했으므로 우리가 free)
+        if (req.username) {
+            free(req.username);
+            req.username = NULL;
+        }
+        
+        // Response의 data 해제
+        // handle_response가 return 문으로 일찍 종료되면 data가 free되지 않을 수 있음.
+        // 안전하게 여기서 체크 후 해제.
+        if (res.data != NULL) {
+            free(res.data);
+            res.data = NULL;
+        }
+        printf("[DEBUG] Terminate finished cleanup\n");
     }
 }
 
@@ -165,7 +180,7 @@ void terminate(int32_t sockfd, const char* active_user) {
 // main
 // -------------------------------------
 int main(int argc, char* argv[]) {
-    // 1. SIGPIPE 무시 설정 (서버가 끊겨도 클라이언트가 죽지 않게 함)
+    // 1. SIGPIPE 시그널 무시 (서버 끊김 시 Crash 방지)
     signal(SIGPIPE, SIG_IGN);
     setup_sigint_handler();
 
@@ -178,7 +193,7 @@ int main(int argc, char* argv[]) {
     if (sockfd < 0) exit(EXIT_FAILURE);
 
     if (argc > 3) {
-        // --- 파일 모드 ---
+        // --- FILE MODE ---
         const char* filename = argv[3];
         FILE* file = fopen(filename, "r");
         if (file == NULL) {
@@ -207,7 +222,7 @@ int main(int argc, char* argv[]) {
         free(line);
         fclose(file);
     } else {
-        // --- 인터랙티브 모드 ---
+        // --- INTERACTIVE MODE ---
         while (true) {
             char* input = readline(""); 
             
@@ -218,9 +233,6 @@ int main(int argc, char* argv[]) {
 
             add_history(input);
 
-            // evaluate 내부에서 문제가 생기는지 확인하기 위해 출력
-            // printf("[DEBUG] Processing input: %s\n", input); 
-            
             if (!evaluate(input, sockfd, &active_user)) {
                 free(input);
                 break;
@@ -230,12 +242,12 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    printf("[DEBUG] Main loop finished. Calling terminate...\n");
+    printf("[DEBUG] Main loop ended. Calling terminate...\n");
     terminate(sockfd, active_user);
     
     printf("[DEBUG] Closing socket...\n");
     close(sockfd);
     
-    printf("[DEBUG] Exiting main.\n");
+    printf("[DEBUG] Exiting success\n");
     return 0;
 }
